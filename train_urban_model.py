@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 
 import joblib
 import numpy as np
@@ -34,27 +35,49 @@ FEATURES = [
 ]
 MIN_INCIDENT_DAYS = 20
 MIN_STATES = 5
+ARCHIVE_LAG_DAYS = 5
 
 
-def fetch_history(lat: float, lon: float, start: datetime, end: datetime) -> pd.DataFrame:
-    response = requests.get(
-        "https://archive-api.open-meteo.com/v1/archive",
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": start.strftime("%Y-%m-%d"),
-            "end_date": end.strftime("%Y-%m-%d"),
-            "hourly": "precipitation",
-            "timezone": "Africa/Lagos",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json().get("hourly", {})
-    return pd.DataFrame({
-        "time": pd.to_datetime(data.get("time", [])),
-        "precipitation": pd.to_numeric(data.get("precipitation", []), errors="coerce").fillna(0.0),
-    })
+def archive_available_through() -> datetime:
+    """Conservative archive cutoff so recent events do not request future/unavailable dates."""
+    return (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_LAG_DAYS)).replace(tzinfo=None)
+
+
+def fetch_history(lat: float, lon: float, start: datetime, end: datetime, retries: int = 3) -> pd.DataFrame:
+    available_end = archive_available_through()
+    end = min(end, available_end)
+    if start.date() > end.date():
+        return pd.DataFrame(columns=["time", "precipitation"])
+
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            response = requests.get(
+                "https://archive-api.open-meteo.com/v1/archive",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "start_date": start.strftime("%Y-%m-%d"),
+                    "end_date": end.strftime("%Y-%m-%d"),
+                    "hourly": "precipitation",
+                    "timezone": "Africa/Lagos",
+                },
+                timeout=45,
+            )
+            response.raise_for_status()
+            data = response.json().get("hourly", {})
+            times = pd.to_datetime(pd.Series(data.get("time", []), dtype="object"), errors="coerce")
+            precip = pd.to_numeric(pd.Series(data.get("precipitation", []), dtype="object"), errors="coerce").fillna(0.0)
+            frame = pd.DataFrame({"time": times, "precipitation": precip}).dropna(subset=["time"])
+            return frame.reset_index(drop=True)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(1.5 * (attempt + 1))
+
+    if last_error:
+        raise last_error
+    return pd.DataFrame(columns=["time", "precipitation"])
 
 
 def sum_window(values: np.ndarray, idx: int, hours: int) -> float:
@@ -78,6 +101,11 @@ def features_at(frame: pd.DataFrame, when: datetime) -> dict | None:
     if len(eligible) == 0:
         return None
     idx = int(eligible[-1])
+    # Do not silently use a rainfall observation days before a recent event whose
+    # event hour is not yet available in the archive.
+    observation_time = pd.Timestamp(frame.loc[idx, "time"])
+    if abs((target - observation_time).total_seconds()) > 3 * 3600:
+        return None
     values = frame["precipitation"].to_numpy(dtype=float)
     return {
         "rain_1h_mm": sum_window(values, idx, 1),
@@ -101,9 +129,6 @@ def cluster_incidents(events: pd.DataFrame) -> pd.DataFrame:
     if "location" not in frame.columns:
         frame["location"] = frame["state"]
     frame["article_count"] = 1
-
-    # Keep the earliest discovered report as the event anchor. It is the least
-    # likely article time to include rainfall that happened long after onset.
     frame = frame.sort_values("event_dt")
     grouped = frame.groupby(["state", "location", "incident_day"], as_index=False).agg(
         event_time=("event_time", "first"),
@@ -121,20 +146,36 @@ def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
     for state, group in incidents.groupby("state"):
         known_days[state] = set(pd.to_datetime(group["incident_day"]).dt.normalize())
 
+    archive_cutoff = archive_available_through()
+    usable_incidents = 0
+    skipped_recent = 0
+    skipped_provider = 0
+
     for _, event in incidents.iterrows():
         when = pd.Timestamp(event["event_time"]).to_pydatetime()
         if when.tzinfo is not None:
-            when = when.astimezone().replace(tzinfo=None)
+            when = when.astimezone(timezone.utc).replace(tzinfo=None)
+
+        # Today's Abuja incident is preserved as evidence immediately but is not
+        # backfilled into model training until the archive actually contains its
+        # event-hour rainfall. This prevents post-hoc fabricated features.
+        if when > archive_cutoff:
+            skipped_recent += 1
+            continue
+
         lat, lon = float(event["latitude"]), float(event["longitude"])
-        start, end = when - timedelta(days=22), when + timedelta(days=15)
+        start = when - timedelta(days=22)
+        end = min(when + timedelta(days=15), archive_cutoff)
         try:
             history = fetch_history(lat, lon, start, end)
         except Exception as exc:
+            skipped_provider += 1
             print(f"weather history skipped for {event['state']} {event['incident_day']}: {exc}")
             continue
 
         positive = features_at(history, when)
         if positive:
+            usable_incidents += 1
             rows.append({
                 **positive,
                 "label": 1,
@@ -143,10 +184,10 @@ def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
                 "incident_day": event["incident_day"],
             })
 
-        # Weak negatives are only used if there is no known flood incident in
-        # the same state within +/- 1 day of the candidate date.
         for offset in (-14, -10, 10, 14):
             negative_time = when + timedelta(days=offset)
+            if negative_time > archive_cutoff:
+                continue
             candidate_day = pd.Timestamp(negative_time.date())
             contaminated = any(abs((candidate_day - positive_day).days) <= 1 for positive_day in known_days.get(event["state"], set()))
             if contaminated:
@@ -161,6 +202,10 @@ def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
                     "incident_day": negative_time.date().isoformat(),
                 })
 
+    print(
+        f"training evidence window: usable_incidents={usable_incidents}, "
+        f"recent_waiting_for_archive={skipped_recent}, provider_skips={skipped_provider}, rows={len(rows)}"
+    )
     return pd.DataFrame(rows)
 
 
@@ -182,7 +227,13 @@ def main():
 
     dataset = build_dataset(incidents)
     if dataset.empty or dataset["label"].nunique() < 2:
-        print("Training dataset could not be built.")
+        print("Training dataset could not yet be built from archive-complete incidents. Evidence remains stored for the next run.")
+        return
+
+    positive_rows = int((dataset["label"] == 1).sum())
+    usable_states = int(dataset.loc[dataset["label"] == 1, "state"].nunique())
+    if positive_rows < 15 or usable_states < 5:
+        print(f"Archive-complete training evidence still too small: {positive_rows} positive incident rows across {usable_states} states. Waiting for more evidence.")
         return
 
     dataset = dataset.sort_values("event_time").reset_index(drop=True)
@@ -191,6 +242,9 @@ def main():
     if test["label"].nunique() < 2:
         split = max(1, int(len(dataset) * 0.7))
         train, test = dataset.iloc[:split], dataset.iloc[split:]
+    if train["label"].nunique() < 2 or test["label"].nunique() < 2:
+        print("Chronological validation split does not yet contain both classes. Waiting for more diverse evidence.")
+        return
 
     X_train, y_train = train[FEATURES], train["label"].astype(int)
     X_test, y_test = test[FEATURES], test["label"].astype(int)
@@ -213,8 +267,8 @@ def main():
     probs = model.predict_proba(X_test)[:, 1]
 
     metrics = {
-        "roc_auc": float(roc_auc_score(y_test, probs)) if y_test.nunique() > 1 else None,
-        "pr_auc": float(average_precision_score(y_test, probs)) if y_test.nunique() > 1 else None,
+        "roc_auc": float(roc_auc_score(y_test, probs)),
+        "pr_auc": float(average_precision_score(y_test, probs)),
         "brier": float(brier_score_loss(y_test, probs)),
     }
 
@@ -224,15 +278,16 @@ def main():
     card = {
         "name": "NaijaClimaGuard Urban Flood Model Candidate",
         "status": "shadow_candidate_not_production",
-        "trained_at": datetime.utcnow().isoformat() + "Z",
+        "trained_at": datetime.now(timezone.utc).isoformat(),
         "raw_positive_news_articles": int(len(raw_events)),
         "independent_incident_days": int(len(incidents)),
-        "states_represented": state_count,
+        "archive_complete_positive_rows": positive_rows,
+        "states_represented": usable_states,
         "training_rows": int(len(train)),
         "test_rows": int(len(test)),
         "features": FEATURES,
         "metrics": metrics,
-        "label_note": "Positive labels are state/location incident-days clustered from news reports describing observed flooding. Multiple articles about the same event count once. Negative labels are noisy nearby dates with no known flood report and are excluded near known incident days.",
+        "label_note": "Positive labels are state/location incident-days clustered from news reports describing observed flooding. Multiple articles about the same event count once. Recent incidents remain evidence-only until event-hour archive rainfall is available. Negative labels are noisy nearby dates with no known flood report and are excluded near known incident days.",
         "known_limitations": [
             "News coverage is geographically and socioeconomically biased.",
             "Event coordinates are currently location centroids rather than exact flooded road coordinates.",
