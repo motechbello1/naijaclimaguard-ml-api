@@ -2,8 +2,9 @@
 
 Multiple newspapers often report the same flood. They must not become multiple
 independent positive samples. This trainer clusters articles into state/location
-incident-days before collecting weather features, and it excludes weak negative
-dates that sit too close to another known flood day.
+incident-days before collecting weather features, excludes weak negative dates
+that sit too close to another known flood day, and fetches one rainfall archive
+window per location rather than repeating the same request for every headline.
 
 The model is intentionally shadow-only. Promotion requires prospective validation.
 """
@@ -14,6 +15,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
@@ -28,6 +30,7 @@ MODEL_DIR = os.path.join(BASE, "model")
 CANDIDATE = os.path.join(MODEL_DIR, "urban_flood_model_candidate.joblib")
 FEATURES_FILE = os.path.join(MODEL_DIR, "urban_feature_cols.joblib")
 CARD = os.path.join(MODEL_DIR, "urban_model_card.json")
+LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 FEATURES = [
     "rain_1h_mm", "rain_3h_mm", "rain_6h_mm", "rain_24h_mm", "rain_72h_mm", "rain_168h_mm",
@@ -39,13 +42,13 @@ ARCHIVE_LAG_DAYS = 5
 
 
 def archive_available_through() -> datetime:
-    """Conservative archive cutoff so recent events do not request future/unavailable dates."""
-    return (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_LAG_DAYS)).replace(tzinfo=None)
+    """Conservative archive cutoff so recent events never request unavailable dates."""
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=ARCHIVE_LAG_DAYS)
+    return cutoff_utc.astimezone(LAGOS_TZ).replace(tzinfo=None, hour=23, minute=0, second=0, microsecond=0)
 
 
 def fetch_history(lat: float, lon: float, start: datetime, end: datetime, retries: int = 3) -> pd.DataFrame:
-    available_end = archive_available_through()
-    end = min(end, available_end)
+    end = min(end, archive_available_through())
     if start.date() > end.date():
         return pd.DataFrame(columns=["time", "precipitation"])
 
@@ -68,7 +71,11 @@ def fetch_history(lat: float, lon: float, start: datetime, end: datetime, retrie
             data = response.json().get("hourly", {})
             times = pd.to_datetime(pd.Series(data.get("time", []), dtype="object"), errors="coerce")
             precip = pd.to_numeric(pd.Series(data.get("precipitation", []), dtype="object"), errors="coerce").fillna(0.0)
-            frame = pd.DataFrame({"time": times, "precipitation": precip}).dropna(subset=["time"])
+            size = min(len(times), len(precip))
+            frame = pd.DataFrame({
+                "time": times.iloc[:size].reset_index(drop=True),
+                "precipitation": precip.iloc[:size].reset_index(drop=True),
+            }).dropna(subset=["time"])
             return frame.reset_index(drop=True)
         except Exception as exc:
             last_error = exc
@@ -96,13 +103,11 @@ def max_rolling(values: np.ndarray, idx: int, lookback: int, width: int) -> floa
 def features_at(frame: pd.DataFrame, when: datetime) -> dict | None:
     if frame.empty:
         return None
-    target = pd.Timestamp(when.replace(tzinfo=None)).floor("h")
+    target = pd.Timestamp(when).floor("h")
     eligible = frame.index[frame["time"] <= target]
     if len(eligible) == 0:
         return None
     idx = int(eligible[-1])
-    # Do not silently use a rainfall observation days before a recent event whose
-    # event hour is not yet available in the archive.
     observation_time = pd.Timestamp(frame.loc[idx, "time"])
     if abs((target - observation_time).total_seconds()) > 3 * 3600:
         return None
@@ -125,7 +130,8 @@ def cluster_incidents(events: pd.DataFrame) -> pd.DataFrame:
     frame = events.copy()
     frame["event_dt"] = pd.to_datetime(frame["event_time"], utc=True, errors="coerce")
     frame = frame.dropna(subset=["event_dt", "state", "latitude", "longitude"])
-    frame["incident_day"] = frame["event_dt"].dt.strftime("%Y-%m-%d")
+    frame["event_dt_lagos"] = frame["event_dt"].dt.tz_convert("Africa/Lagos")
+    frame["incident_day"] = frame["event_dt_lagos"].dt.strftime("%Y-%m-%d")
     if "location" not in frame.columns:
         frame["location"] = frame["state"]
     frame["article_count"] = 1
@@ -140,8 +146,15 @@ def cluster_incidents(events: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values("event_time").reset_index(drop=True)
 
 
+def to_lagos_naive(value: str) -> datetime:
+    when = pd.Timestamp(value).to_pydatetime()
+    if when.tzinfo is not None:
+        return when.astimezone(LAGOS_TZ).replace(tzinfo=None)
+    return when
+
+
 def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    rows: list[dict] = []
     known_days: dict[str, set[pd.Timestamp]] = {}
     for state, group in incidents.groupby("state"):
         known_days[state] = set(pd.to_datetime(group["incident_day"]).dt.normalize())
@@ -151,62 +164,77 @@ def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
     skipped_recent = 0
     skipped_provider = 0
 
-    for _, event in incidents.iterrows():
-        when = pd.Timestamp(event["event_time"]).to_pydatetime()
-        if when.tzinfo is not None:
-            when = when.astimezone(timezone.utc).replace(tzinfo=None)
+    # One historical request per state/location centroid. This is much faster and
+    # less likely to hit provider rate limits than one request per news incident.
+    grouped = incidents.groupby(["state", "latitude", "longitude"], dropna=False)
+    for (state, lat, lon), group in grouped:
+        location_events: list[tuple[pd.Series, datetime]] = []
+        for _, event in group.sort_values("event_time").iterrows():
+            when = to_lagos_naive(str(event["event_time"]))
+            if when > archive_cutoff:
+                skipped_recent += 1
+                continue
+            location_events.append((event, when))
 
-        # Today's Abuja incident is preserved as evidence immediately but is not
-        # backfilled into model training until the archive actually contains its
-        # event-hour rainfall. This prevents post-hoc fabricated features.
-        if when > archive_cutoff:
-            skipped_recent += 1
+        if not location_events:
             continue
 
-        lat, lon = float(event["latitude"]), float(event["longitude"])
-        start = when - timedelta(days=22)
-        end = min(when + timedelta(days=15), archive_cutoff)
+        min_when = min(when for _, when in location_events)
+        max_when = max(when for _, when in location_events)
+        start = min_when - timedelta(days=22)
+        end = min(max_when + timedelta(days=15), archive_cutoff)
+
         try:
-            history = fetch_history(lat, lon, start, end)
+            history = fetch_history(float(lat), float(lon), start, end)
         except Exception as exc:
-            skipped_provider += 1
-            print(f"weather history skipped for {event['state']} {event['incident_day']}: {exc}")
+            skipped_provider += len(location_events)
+            print(f"weather history skipped for {state}: {exc}")
+            continue
+        if history.empty:
+            skipped_provider += len(location_events)
+            print(f"weather history empty for {state}")
             continue
 
-        positive = features_at(history, when)
-        if positive:
-            usable_incidents += 1
-            rows.append({
-                **positive,
-                "label": 1,
-                "event_time": when.isoformat(),
-                "state": event["state"],
-                "incident_day": event["incident_day"],
-            })
-
-        for offset in (-14, -10, 10, 14):
-            negative_time = when + timedelta(days=offset)
-            if negative_time > archive_cutoff:
-                continue
-            candidate_day = pd.Timestamp(negative_time.date())
-            contaminated = any(abs((candidate_day - positive_day).days) <= 1 for positive_day in known_days.get(event["state"], set()))
-            if contaminated:
-                continue
-            negative = features_at(history, negative_time)
-            if negative:
+        for event, when in location_events:
+            positive = features_at(history, when)
+            if positive:
+                usable_incidents += 1
                 rows.append({
-                    **negative,
-                    "label": 0,
-                    "event_time": negative_time.isoformat(),
-                    "state": event["state"],
-                    "incident_day": negative_time.date().isoformat(),
+                    **positive,
+                    "label": 1,
+                    "event_time": when.isoformat(),
+                    "state": str(state),
+                    "incident_day": event["incident_day"],
                 })
+
+            for offset in (-14, -10, 10, 14):
+                negative_time = when + timedelta(days=offset)
+                if negative_time < start or negative_time > end:
+                    continue
+                candidate_day = pd.Timestamp(negative_time.date())
+                contaminated = any(
+                    abs((candidate_day - positive_day).days) <= 1
+                    for positive_day in known_days.get(str(state), set())
+                )
+                if contaminated:
+                    continue
+                negative = features_at(history, negative_time)
+                if negative:
+                    rows.append({
+                        **negative,
+                        "label": 0,
+                        "event_time": negative_time.isoformat(),
+                        "state": str(state),
+                        "incident_day": negative_time.date().isoformat(),
+                    })
 
     print(
         f"training evidence window: usable_incidents={usable_incidents}, "
         f"recent_waiting_for_archive={skipped_recent}, provider_skips={skipped_provider}, rows={len(rows)}"
     )
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset=["state", "event_time", "label"]).reset_index(drop=True)
 
 
 def main():
