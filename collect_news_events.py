@@ -1,9 +1,12 @@
 """Collect high-confidence Nigerian flood occurrence labels from live news discovery.
 
-GDELT is useful but can be temporarily unavailable, so Google News RSS is also
-used as an independent discovery channel. News remains weak supervision: only
-headlines that describe flooding as already occurring and name a Nigerian
-location become positive training evidence.
+The collector has two modes:
+1. Daily live discovery from national and major-outlet searches.
+2. Automatic historical backfill while the evidence store is still small. It
+   queries every state/FCT so the urban model does not learn only Abuja/Lagos.
+
+News remains weak supervision: only headlines that describe flooding as already
+occurring and name a Nigerian location become positive training evidence.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import csv
 import html
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -20,6 +24,7 @@ from urllib.parse import quote_plus, urlparse
 import requests
 
 OUT_PATH = os.path.join(os.path.dirname(__file__), "data", "urban_flood_events.csv")
+BACKFILL_TARGET = 120
 
 LOCATIONS = [
     ("FCT", "Abuja", 9.0765, 7.3986, ["abuja", "fct", "maitama", "asokoro", "garki", "wuse", "wuse 2", "gudu", "lokogoma", "gaduwa", "lugbe", "kubwa", "jabi", "gwarinpa", "apo", "guzape", "nyanya", "kuje", "gwagwalada", "bwari"]),
@@ -151,7 +156,7 @@ def fetch_google_news(query: str) -> list[dict]:
         return []
 
 
-def fetch_articles() -> list[dict]:
+def fetch_live_articles() -> list[dict]:
     rows = fetch_gdelt_articles()
     queries = [
         '(flood OR flooding OR "flash flood") Nigeria when:7d',
@@ -165,11 +170,32 @@ def fetch_articles() -> list[dict]:
     return rows
 
 
+def fetch_historical_backfill(existing_rows: int) -> list[dict]:
+    if existing_rows >= BACKFILL_TARGET:
+        return []
+    print(f"Historical backfill active: {existing_rows}/{BACKFILL_TARGET} evidence rows")
+    rows: list[dict] = []
+    # One state-specific query each substantially reduces Lagos/Abuja bias without
+    # hammering any individual publisher. The collector stops historical expansion
+    # once the evidence store is large enough for shadow research.
+    for state, city, _lat, _lon, _aliases in LOCATIONS:
+        query_place = "Abuja FCT" if state == "FCT" else f'"{state}" Nigeria'
+        queries = [
+            f'(flood OR flooding OR "flash flood") {query_place} when:365d',
+            f'(flood OR flooding) "{city}" Nigeria when:365d',
+        ]
+        for query in queries:
+            rows.extend(fetch_google_news(query))
+            time.sleep(0.18)
+    return rows
+
+
 def main():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     existing = load_existing()
     added = 0
-    discovered = fetch_articles()
+    discovered = fetch_live_articles()
+    discovered.extend(fetch_historical_backfill(len(existing)))
 
     for article in discovered:
         title = clean_title(str(article.get("title") or ""))
@@ -211,7 +237,8 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"urban flood event store: {len(rows)} rows ({added} new from {len(discovered)} discovered articles)")
+    state_count = len({row["state"] for row in rows})
+    print(f"urban flood event store: {len(rows)} rows across {state_count} states/FCT ({added} new from {len(discovered)} discovered articles)")
 
 
 if __name__ == "__main__":
