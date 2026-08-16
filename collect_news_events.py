@@ -1,28 +1,32 @@
-"""Collect high-confidence Nigerian flood occurrence labels from GDELT.
+"""Collect high-confidence Nigerian flood occurrence labels from live news discovery.
 
-The output is weakly-supervised evidence for the urban flash-flood model. A news
-article is never treated as a perfect sensor: we only keep headlines that both
-name a Nigerian location and describe flooding as already occurring.
+GDELT is useful but can be temporarily unavailable, so Google News RSS is also
+used as an independent discovery channel. News remains weak supervision: only
+headlines that describe flooding as already occurring and name a Nigerian
+location become positive training evidence.
 """
 
 from __future__ import annotations
 
 import csv
+import html
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus, urlparse
 
 import requests
 
 OUT_PATH = os.path.join(os.path.dirname(__file__), "data", "urban_flood_events.csv")
 
 LOCATIONS = [
-    ("FCT", "Abuja", 9.0765, 7.3986, ["abuja", "fct", "maitama", "asokoro", "garki", "wuse", "lugbe", "kubwa", "jabi", "gwarinpa", "apo", "guzape", "nyanya", "kuje", "gwagwalada", "bwari"]),
+    ("FCT", "Abuja", 9.0765, 7.3986, ["abuja", "fct", "maitama", "asokoro", "garki", "wuse", "wuse 2", "gudu", "lokogoma", "gaduwa", "lugbe", "kubwa", "jabi", "gwarinpa", "apo", "guzape", "nyanya", "kuje", "gwagwalada", "bwari"]),
     ("Abia", "Umuahia", 5.5249, 7.4946, ["abia", "umuahia", "aba"]),
     ("Adamawa", "Yola", 9.2035, 12.4954, ["adamawa", "yola", "mubi"]),
     ("Akwa Ibom", "Uyo", 5.0389, 7.9098, ["akwa ibom", "uyo", "eket"]),
-    ("Anambra", "Awka", 6.2101, 7.0741, ["anambra", "awka", "onitsha", "nnewi"]),
+    ("Anambra", "Awka", 6.2101, 7.0741, ["anambra", "awka", "onitsha", "nnewi", "ogidi"]),
     ("Bauchi", "Bauchi", 10.3158, 9.8442, ["bauchi"]),
     ("Bayelsa", "Yenagoa", 4.9267, 6.2676, ["bayelsa", "yenagoa"]),
     ("Benue", "Makurdi", 7.7337, 8.5214, ["benue", "makurdi"]),
@@ -44,7 +48,7 @@ LOCATIONS = [
     ("Kwara", "Ilorin", 8.4966, 4.5421, ["kwara", "ilorin"]),
     ("Lagos", "Ikeja", 6.6018, 3.3515, ["lagos", "ikeja", "lekki", "victoria island", "ikorodu", "epe", "ajah"]),
     ("Nasarawa", "Lafia", 8.4966, 8.5153, ["nasarawa", "lafia", "keffi", "mararaba"]),
-    ("Niger", "Minna", 9.6139, 6.5569, ["niger state", "minna", "suleja", "bida"]),
+    ("Niger", "Minna", 9.6139, 6.5569, ["niger state", "minna", "suleja", "bida", "shiroro"]),
     ("Ogun", "Abeokuta", 7.1475, 3.3619, ["ogun", "abeokuta", "ijebu ode", "ota", "sagamu"]),
     ("Ondo", "Akure", 7.2571, 5.2058, ["ondo state", "akure"]),
     ("Osun", "Osogbo", 7.7827, 4.5418, ["osun", "osogbo", "ile-ife", "ile ife", "ilesa"]),
@@ -57,8 +61,27 @@ LOCATIONS = [
     ("Zamfara", "Gusau", 12.1704, 6.6641, ["zamfara", "gusau"]),
 ]
 
-OCCURRED = re.compile(r"\b(flooded|flooding|floods|flash flood|inundated|submerged|swept|sweeps|washed away|overflowed)\b", re.I)
+OCCURRED = re.compile(r"\b(flooded|flooding|floods|flash flood|inundated|submerged|submerges|swept|sweeps|washed away|overflowed)\b", re.I)
 WARNING_ONLY = re.compile(r"\b(warns?|warning|forecast|expected|may flood|risk of flooding|alert issued)\b", re.I)
+OCCURRENCE_OVERRIDE = re.compile(r"\b(flooded|flooding|floods|submerged|submerges|inundated|swept|sweeps)\b", re.I)
+
+
+def alias_match(text: str, alias: str) -> bool:
+    pattern = r"(^|[^a-z0-9])" + re.escape(alias.lower()).replace(r"\ ", r"[-\s]+").replace(r"\-", r"[-\s]+") + r"([^a-z0-9]|$)"
+    return bool(re.search(pattern, text.lower()))
+
+
+def locate(text: str):
+    matches = []
+    for state, city, lat, lon, aliases in LOCATIONS:
+        for alias in aliases:
+            if alias_match(text, alias):
+                matches.append((len(alias), state, city, lat, lon, alias))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    _, state, city, lat, lon, hit = matches[0]
+    return state, city, lat, lon, hit
 
 
 def parse_gdelt_time(value: str) -> datetime | None:
@@ -66,25 +89,14 @@ def parse_gdelt_time(value: str) -> datetime | None:
         return None
     for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S"):
         try:
-            dt = datetime.strptime(value, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
     return None
 
 
-def locate(text: str):
-    lower = text.lower()
-    matches = []
-    for state, city, lat, lon, aliases in LOCATIONS:
-        hit = next((alias for alias in aliases if alias in lower), None)
-        if hit:
-            matches.append((len(hit), state, city, lat, lon, hit))
-    if not matches:
-        return None
-    matches.sort(reverse=True)
-    _, state, city, lat, lon, hit = matches[0]
-    return state, city, lat, lon, hit
+def clean_title(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", value or ""))).strip()
 
 
 def key(row: dict[str, str]) -> str:
@@ -96,50 +108,93 @@ def load_existing() -> dict[str, dict[str, str]]:
     if not os.path.exists(OUT_PATH):
         return {}
     with open(OUT_PATH, newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    return {key(row): row for row in rows}
+        return {key(row): row for row in csv.DictReader(handle)}
 
 
-def fetch_articles():
-    query = '(flood OR flooding OR "flash flood" OR inundation) Nigeria'
-    response = requests.get(
-        "https://api.gdeltproject.org/api/v2/doc/doc",
-        params={"query": query, "mode": "ArtList", "maxrecords": 250, "format": "json", "timespan": "3months", "sort": "DateDesc"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json().get("articles", [])
+def fetch_gdelt_articles() -> list[dict]:
+    try:
+        response = requests.get(
+            "https://api.gdeltproject.org/api/v2/doc/doc",
+            params={"query": '(flood OR flooding OR "flash flood" OR inundation) Nigeria', "mode": "ArtList", "maxrecords": 250, "format": "json", "timespan": "3months", "sort": "DateDesc"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return [
+            {"title": item.get("title", ""), "url": item.get("url", ""), "published": parse_gdelt_time(str(item.get("seendate") or "")), "source": str(item.get("domain") or "GDELT")}
+            for item in response.json().get("articles", [])
+        ]
+    except Exception as exc:
+        print(f"GDELT unavailable: {exc}")
+        return []
+
+
+def fetch_google_news(query: str) -> list[dict]:
+    try:
+        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-NG&gl=NG&ceid=NG:en"
+        response = requests.get(url, timeout=30, headers={"User-Agent": "NaijaClimaGuard flood evidence collector"})
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        rows = []
+        for item in root.findall("./channel/item"):
+            title = clean_title(item.findtext("title") or "")
+            link = (item.findtext("link") or "").strip()
+            source_node = item.find("source")
+            source = clean_title(source_node.text or "Google News") if source_node is not None else "Google News"
+            try:
+                published = parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc)
+            except Exception:
+                published = None
+            rows.append({"title": title, "url": link, "published": published, "source": source})
+        return rows
+    except Exception as exc:
+        print(f"Google News query failed ({query}): {exc}")
+        return []
+
+
+def fetch_articles() -> list[dict]:
+    rows = fetch_gdelt_articles()
+    queries = [
+        '(flood OR flooding OR "flash flood") Nigeria when:7d',
+        'site:vanguardngr.com (flood OR flooding) Nigeria when:7d',
+        'site:guardian.ng (flood OR flooding) Nigeria when:7d',
+        'site:dailytrust.com (flood OR flooding) Nigeria when:7d',
+        'site:thecable.ng (flood OR flooding) Nigeria when:7d',
+    ]
+    for query in queries:
+        rows.extend(fetch_google_news(query))
+    return rows
 
 
 def main():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     existing = load_existing()
     added = 0
+    discovered = fetch_articles()
 
-    for article in fetch_articles():
-        title = str(article.get("title") or "").strip()
+    for article in discovered:
+        title = clean_title(str(article.get("title") or ""))
         if not title or not OCCURRED.search(title):
             continue
-        # A headline that only forecasts risk should not become a positive label.
-        if WARNING_ONLY.search(title) and not re.search(r"\b(flooded|flooding|floods|submerged|inundated|swept|sweeps)\b", title, re.I):
+        if WARNING_ONLY.search(title) and not OCCURRENCE_OVERRIDE.search(title):
             continue
         location = locate(title)
         if not location:
             continue
-        event_time = parse_gdelt_time(str(article.get("seendate") or ""))
-        if not event_time:
+        event_time = article.get("published")
+        if not isinstance(event_time, datetime):
             continue
         state, city, lat, lon, matched = location
         source_url = str(article.get("url") or "")
+        source_domain = str(article.get("source") or "").strip() or urlparse(source_url).netloc.replace("www.", "")
         row = {
-            "event_time": event_time.isoformat(),
+            "event_time": event_time.astimezone(timezone.utc).isoformat(),
             "state": state,
             "location": city,
             "latitude": f"{lat:.5f}",
             "longitude": f"{lon:.5f}",
             "title": title,
             "source_url": source_url,
-            "source_domain": urlparse(source_url).netloc.replace("www.", ""),
+            "source_domain": source_domain,
             "matched_alias": matched,
             "label": "1",
             "confidence": "news_reported_occurrence",
@@ -156,7 +211,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"urban flood event store: {len(rows)} rows ({added} new)")
+    print(f"urban flood event store: {len(rows)} rows ({added} new from {len(discovered)} discovered articles)")
 
 
 if __name__ == "__main__":
