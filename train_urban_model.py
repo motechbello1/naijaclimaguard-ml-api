@@ -1,7 +1,11 @@
 """Train a shadow urban flash-flood model from news-labelled flood events.
 
-This model is intentionally NOT auto-promoted to production. The script writes a
-candidate model plus a model card. Promotion requires prospective validation.
+Multiple newspapers often report the same flood. They must not become multiple
+independent positive samples. This trainer clusters articles into state/location
+incident-days before collecting weather features, and it excludes weak negative
+dates that sit too close to another known flood day.
+
+The model is intentionally shadow-only. Promotion requires prospective validation.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ FEATURES = [
     "rain_1h_mm", "rain_3h_mm", "rain_6h_mm", "rain_24h_mm", "rain_72h_mm", "rain_168h_mm",
     "max_1h_last_6h_mm", "max_3h_last_24h_mm", "hour_of_day", "month",
 ]
+MIN_INCIDENT_DAYS = 20
+MIN_STATES = 5
 
 
 def fetch_history(lat: float, lon: float, start: datetime, end: datetime) -> pd.DataFrame:
@@ -45,16 +51,14 @@ def fetch_history(lat: float, lon: float, start: datetime, end: datetime) -> pd.
     )
     response.raise_for_status()
     data = response.json().get("hourly", {})
-    frame = pd.DataFrame({
+    return pd.DataFrame({
         "time": pd.to_datetime(data.get("time", [])),
         "precipitation": pd.to_numeric(data.get("precipitation", []), errors="coerce").fillna(0.0),
     })
-    return frame
 
 
 def sum_window(values: np.ndarray, idx: int, hours: int) -> float:
-    start = max(0, idx - hours + 1)
-    return float(values[start:idx + 1].sum())
+    return float(values[max(0, idx - hours + 1):idx + 1].sum())
 
 
 def max_rolling(values: np.ndarray, idx: int, lookback: int, width: int) -> float:
@@ -70,8 +74,7 @@ def features_at(frame: pd.DataFrame, when: datetime) -> dict | None:
     if frame.empty:
         return None
     target = pd.Timestamp(when.replace(tzinfo=None)).floor("h")
-    times = frame["time"]
-    eligible = frame.index[times <= target]
+    eligible = frame.index[frame["time"] <= target]
     if len(eligible) == 0:
         return None
     idx = int(eligible[-1])
@@ -90,32 +93,73 @@ def features_at(frame: pd.DataFrame, when: datetime) -> dict | None:
     }
 
 
-def build_dataset(events: pd.DataFrame) -> pd.DataFrame:
+def cluster_incidents(events: pd.DataFrame) -> pd.DataFrame:
+    frame = events.copy()
+    frame["event_dt"] = pd.to_datetime(frame["event_time"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["event_dt", "state", "latitude", "longitude"])
+    frame["incident_day"] = frame["event_dt"].dt.strftime("%Y-%m-%d")
+    if "location" not in frame.columns:
+        frame["location"] = frame["state"]
+    frame["article_count"] = 1
+
+    # Keep the earliest discovered report as the event anchor. It is the least
+    # likely article time to include rainfall that happened long after onset.
+    frame = frame.sort_values("event_dt")
+    grouped = frame.groupby(["state", "location", "incident_day"], as_index=False).agg(
+        event_time=("event_time", "first"),
+        latitude=("latitude", "first"),
+        longitude=("longitude", "first"),
+        article_count=("article_count", "sum"),
+        source_count=("source_domain", "nunique"),
+    )
+    return grouped.sort_values("event_time").reset_index(drop=True)
+
+
+def build_dataset(incidents: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for _, event in events.iterrows():
+    known_days: dict[str, set[pd.Timestamp]] = {}
+    for state, group in incidents.groupby("state"):
+        known_days[state] = set(pd.to_datetime(group["incident_day"]).dt.normalize())
+
+    for _, event in incidents.iterrows():
         when = pd.Timestamp(event["event_time"]).to_pydatetime()
         if when.tzinfo is not None:
             when = when.astimezone().replace(tzinfo=None)
         lat, lon = float(event["latitude"]), float(event["longitude"])
-        start = when - timedelta(days=22)
-        end = when + timedelta(days=15)
+        start, end = when - timedelta(days=22), when + timedelta(days=15)
         try:
             history = fetch_history(lat, lon, start, end)
         except Exception as exc:
-            print(f"weather history skipped for {event['state']}: {exc}")
+            print(f"weather history skipped for {event['state']} {event['incident_day']}: {exc}")
             continue
 
         positive = features_at(history, when)
         if positive:
-            rows.append({**positive, "label": 1, "event_time": when.isoformat(), "state": event["state"]})
+            rows.append({
+                **positive,
+                "label": 1,
+                "event_time": when.isoformat(),
+                "state": event["state"],
+                "incident_day": event["incident_day"],
+            })
 
-        # Weak negatives: nearby dates with no news-labelled occurrence at this location.
-        # These are deliberately treated as noisy negatives, which is why the model stays shadow-only.
+        # Weak negatives are only used if there is no known flood incident in
+        # the same state within +/- 1 day of the candidate date.
         for offset in (-14, -10, 10, 14):
             negative_time = when + timedelta(days=offset)
+            candidate_day = pd.Timestamp(negative_time.date())
+            contaminated = any(abs((candidate_day - positive_day).days) <= 1 for positive_day in known_days.get(event["state"], set()))
+            if contaminated:
+                continue
             negative = features_at(history, negative_time)
             if negative:
-                rows.append({**negative, "label": 0, "event_time": negative_time.isoformat(), "state": event["state"]})
+                rows.append({
+                    **negative,
+                    "label": 0,
+                    "event_time": negative_time.isoformat(),
+                    "state": event["state"],
+                    "incident_day": negative_time.date().isoformat(),
+                })
 
     return pd.DataFrame(rows)
 
@@ -124,13 +168,19 @@ def main():
     if not os.path.exists(EVENTS):
         print("No event store yet; run collect_news_events.py first.")
         return
-    events = pd.read_csv(EVENTS)
-    events = events[events["label"].astype(str) == "1"].drop_duplicates(subset=["event_time", "state", "title"])
-    if len(events) < 20 or events["state"].nunique() < 5:
-        print(f"Not enough national evidence yet: {len(events)} events across {events['state'].nunique()} states. Need >=20 events across >=5 states.")
+
+    raw_events = pd.read_csv(EVENTS)
+    raw_events = raw_events[raw_events["label"].astype(str) == "1"].drop_duplicates(subset=["event_time", "state", "title"])
+    incidents = cluster_incidents(raw_events)
+    state_count = int(incidents["state"].nunique()) if not incidents.empty else 0
+    if len(incidents) < MIN_INCIDENT_DAYS or state_count < MIN_STATES:
+        print(
+            f"Not enough independent national incidents yet: {len(incidents)} incident-days across {state_count} states. "
+            f"Raw articles={len(raw_events)}. Need >={MIN_INCIDENT_DAYS} incident-days across >={MIN_STATES} states."
+        )
         return
 
-    dataset = build_dataset(events)
+    dataset = build_dataset(incidents)
     if dataset.empty or dataset["label"].nunique() < 2:
         print("Training dataset could not be built.")
         return
@@ -175,14 +225,21 @@ def main():
         "name": "NaijaClimaGuard Urban Flood Model Candidate",
         "status": "shadow_candidate_not_production",
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "positive_news_events": int(len(events)),
-        "states_represented": int(events["state"].nunique()),
+        "raw_positive_news_articles": int(len(raw_events)),
+        "independent_incident_days": int(len(incidents)),
+        "states_represented": state_count,
         "training_rows": int(len(train)),
         "test_rows": int(len(test)),
         "features": FEATURES,
         "metrics": metrics,
-        "label_note": "Positive labels come from news headlines describing observed flooding. Negative labels are weak/noisy nearby dates without a matched report.",
-        "promotion_rule": "Do not promote automatically. Require prospective shadow validation against independently verified flood occurrence and non-occurrence windows.",
+        "label_note": "Positive labels are state/location incident-days clustered from news reports describing observed flooding. Multiple articles about the same event count once. Negative labels are noisy nearby dates with no known flood report and are excluded near known incident days.",
+        "known_limitations": [
+            "News coverage is geographically and socioeconomically biased.",
+            "Event coordinates are currently location centroids rather than exact flooded road coordinates.",
+            "Open-Meteo archive rainfall may smooth highly local convective storms.",
+            "The dataset has weak negative labels because absence of a news report is not proof that no flood occurred.",
+        ],
+        "promotion_rule": "Do not promote automatically. Require prospective shadow validation against independently verified flood occurrence and non-occurrence windows, with recall, false-alarm rate and calibration reported by geography.",
     }
     with open(CARD, "w", encoding="utf-8") as handle:
         json.dump(card, handle, indent=2)
