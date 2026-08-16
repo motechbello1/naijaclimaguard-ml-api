@@ -1,0 +1,41 @@
+name: Urban flood learning
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  collect-and-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Collect nationwide flood occurrence labels
+        run: python collect_news_events.py
+      - name: Train shadow urban model when evidence is sufficient
+        run: python train_urban_model.py
+      - name: Persist evidence and shadow artifacts
+        run: |
+          if git diff --quiet && git status --porcelain | grep -q '^$'; then
+            echo "No changes to persist"
+            exit 0
+          fi
+          git config user.name "naijaclimaguard-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/urban_flood_events.csv model/urban_flood_model_candidate.joblib model/urban_feature_cols.joblib model/urban_model_card.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No tracked learning changes"
+            exit 0
+          fi
+          git commit -m "data: refresh urban flood evidence and shadow model"
+          git push
