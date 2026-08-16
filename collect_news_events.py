@@ -5,8 +5,10 @@ The collector has two modes:
 2. Automatic historical backfill while the evidence store is still small. It
    queries every state/FCT so the urban model does not learn only Abuja/Lagos.
 
-News remains weak supervision: only headlines that describe flooding as already
-occurring and name a Nigerian location become positive training evidence.
+News remains weak supervision. The training store is intentionally stricter than
+the public live-news feed: warnings, forecasts, archive pages and ambiguous
+mentions of "flooding" are excluded unless the headline also describes physical
+impact that indicates flooding actually occurred.
 """
 
 from __future__ import annotations
@@ -66,9 +68,31 @@ LOCATIONS = [
     ("Zamfara", "Gusau", 12.1704, 6.6641, ["zamfara", "gusau"]),
 ]
 
-OCCURRED = re.compile(r"\b(flooded|flooding|floods|flash flood|inundated|submerged|submerges|swept|sweeps|washed away|overflowed)\b", re.I)
-WARNING_ONLY = re.compile(r"\b(warns?|warning|forecast|expected|may flood|risk of flooding|alert issued)\b", re.I)
-OCCURRENCE_OVERRIDE = re.compile(r"\b(flooded|flooding|floods|submerged|submerges|inundated|swept|sweeps)\b", re.I)
+FLOOD_TERM = re.compile(r"\b(flood|floods|flooded|flooding|flash flood|inundat(?:ed|ion)|overflowed)\b", re.I)
+STRONG_OCCURRENCE = re.compile(
+    r"\b(submerged?|submerges|flooded|swept|sweeps|washed away|ravaged?|ravages|"
+    r"displaced?|displaces|stranded|trapped|drowned?|destroyed?|damaged?|collapsed?|"
+    r"flood impact|impact of (?:the )?flood|affected by flooding|communities affected|"
+    r"roads? flooded|homes? flooded|flood hits?|flood hit|flash flood hits?|flood sweeps?)\b",
+    re.I,
+)
+FORWARD_LOOKING = re.compile(
+    r"\b(warns?|warning|forecast(?:s|ed|ing)?|possible|expected|may|could|risk of|"
+    r"alert(?:s|ed)?|preparedness|deploys? flood warning|early warning|likely)\b",
+    re.I,
+)
+META_PAGE = re.compile(r"\b(archives?|archive page|tag page|latest news on|explainer)\b", re.I)
+
+
+def is_observed_occurrence(title: str) -> bool:
+    """Return True only for headlines safe enough to use as positive ML labels."""
+    if not FLOOD_TERM.search(title):
+        return False
+    if META_PAGE.search(title) and not STRONG_OCCURRENCE.search(title):
+        return False
+    if FORWARD_LOOKING.search(title) and not STRONG_OCCURRENCE.search(title):
+        return False
+    return bool(STRONG_OCCURRENCE.search(title))
 
 
 def alias_match(text: str, alias: str) -> bool:
@@ -113,7 +137,14 @@ def load_existing() -> dict[str, dict[str, str]]:
     if not os.path.exists(OUT_PATH):
         return {}
     with open(OUT_PATH, newline="", encoding="utf-8") as handle:
-        return {key(row): row for row in csv.DictReader(handle)}
+        rows = list(csv.DictReader(handle))
+    # Revalidate old rows whenever the label policy gets stricter. This prevents
+    # an earlier false-positive warning headline from remaining in training data.
+    cleaned = [row for row in rows if is_observed_occurrence(clean_title(row.get("title", "")))]
+    removed = len(rows) - len(cleaned)
+    if removed:
+        print(f"label quality gate removed {removed} weak historical rows")
+    return {key(row): row for row in cleaned}
 
 
 def fetch_gdelt_articles() -> list[dict]:
@@ -175,9 +206,6 @@ def fetch_historical_backfill(existing_rows: int) -> list[dict]:
         return []
     print(f"Historical backfill active: {existing_rows}/{BACKFILL_TARGET} evidence rows")
     rows: list[dict] = []
-    # One state-specific query each substantially reduces Lagos/Abuja bias without
-    # hammering any individual publisher. The collector stops historical expansion
-    # once the evidence store is large enough for shadow research.
     for state, city, _lat, _lon, _aliases in LOCATIONS:
         query_place = "Abuja FCT" if state == "FCT" else f'"{state}" Nigeria'
         queries = [
@@ -199,9 +227,7 @@ def main():
 
     for article in discovered:
         title = clean_title(str(article.get("title") or ""))
-        if not title or not OCCURRED.search(title):
-            continue
-        if WARNING_ONLY.search(title) and not OCCURRENCE_OVERRIDE.search(title):
+        if not title or not is_observed_occurrence(title):
             continue
         location = locate(title)
         if not location:
@@ -223,7 +249,7 @@ def main():
             "source_domain": source_domain,
             "matched_alias": matched,
             "label": "1",
-            "confidence": "news_reported_occurrence",
+            "confidence": "news_reported_physical_impact",
         }
         k = key(row)
         if k not in existing:
