@@ -40,7 +40,17 @@ jobs:
           fi
           git config user.name "naijaclimaguard-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/urban_flood_events.csv model/urban_flood_model_candidate.joblib model/urban_feature_cols.joblib model/urban_model_card.json 2>/dev/null || true
+          if [ -f data/urban_flood_events.csv ]; then
+            git add data/urban_flood_events.csv
+          fi
+          for artifact in \
+            model/urban_flood_model_candidate.joblib \
+            model/urban_feature_cols.joblib \
+            model/urban_model_card.json; do
+            if [ -f "$artifact" ]; then
+              git add "$artifact"
+            fi
+          done
           if git diff --cached --quiet; then
             echo "No tracked learning changes"
             exit 0
