@@ -4,6 +4,14 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "20 2 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "collect_news_events.py"
+      - "train_urban_model.py"
+      - "main.py"
+      - "requirements.txt"
+      - ".github/workflows/urban-flood-learning.yml"
 
 permissions:
   contents: write
@@ -26,7 +34,7 @@ jobs:
         run: python train_urban_model.py
       - name: Persist evidence and shadow artifacts
         run: |
-          if git diff --quiet && git status --porcelain | grep -q '^$'; then
+          if git diff --quiet && [ -z "$(git status --porcelain)" ]; then
             echo "No changes to persist"
             exit 0
           fi
