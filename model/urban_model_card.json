@@ -1,13 +1,13 @@
 {
   "name": "NaijaClimaGuard Urban Flood Model Candidate",
   "status": "shadow_candidate_not_production",
-  "trained_at": "2026-10-09T09:20:27.461281+00:00",
+  "trained_at": "2026-10-10T08:41:29.690781+00:00",
   "raw_positive_news_articles": 204,
   "independent_incident_days": 103,
-  "archive_complete_positive_rows": 97,
-  "states_represented": 26,
-  "training_rows": 338,
-  "test_rows": 85,
+  "archive_complete_positive_rows": 100,
+  "states_represented": 27,
+  "training_rows": 349,
+  "test_rows": 88,
   "features": [
     "rain_1h_mm",
     "rain_3h_mm",
@@ -21,9 +21,9 @@
     "month"
   ],
   "metrics": {
-    "roc_auc": 0.43666666666666665,
-    "pr_auc": 0.2651744715678395,
-    "brier": 0.2637667514170921
+    "roc_auc": 0.4380952380952381,
+    "pr_auc": 0.2672832451773408,
+    "brier": 0.2669734421720864
   },
   "label_note": "Positive labels are state/location incident-days clustered from news reports describing observed flooding. Multiple articles about the same event count once. Recent incidents remain evidence-only until event-hour archive rainfall is available. Negative labels are noisy nearby dates with no known flood report and are excluded near known incident days.",
   "known_limitations": [
