@@ -1,7 +1,7 @@
 {
   "name": "NaijaClimaGuard Urban Flood Model Candidate",
   "status": "shadow_candidate_not_production",
-  "trained_at": "2026-11-12T10:02:05.119780+00:00",
+  "trained_at": "2026-11-13T09:48:14.856661+00:00",
   "raw_positive_news_articles": 230,
   "independent_incident_days": 116,
   "archive_complete_positive_rows": 111,
